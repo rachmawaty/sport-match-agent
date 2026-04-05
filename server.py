@@ -1,6 +1,6 @@
 """
-HubSports - Boston Sports Schedule MCP Agent
-Fetches upcoming games for Patriots, Celtics, Bruins, and Red Sox
+Sport Match Agent - Boston Sports Schedule + Match Prediction
+Fetches upcoming games and predicts outcomes using Claude AI.
 """
 
 from fastapi import FastAPI
@@ -11,11 +11,12 @@ import httpx
 from datetime import datetime, timedelta
 from dateutil import parser
 import logging
+from predictor import predict_match as run_prediction, fetch_upcoming_games, TEAMS as PREDICTOR_TEAMS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="HubSports MCP Agent", version="1.0.0")
+app = FastAPI(title="Sport Match Agent", version="2.0.0")
 
 # CORS
 app.add_middleware(
@@ -165,38 +166,71 @@ async def get_all_upcoming_games(days_ahead: int = 14) -> List[Dict[str, Any]]:
 @app.post("/decide")
 async def mcp_decide(request: MCPDecideRequest) -> Dict[str, Any]:
     """
-    MCP /decide endpoint - called by AgenticTown orchestrator each cycle
-    
-    Returns actions the agent wants to take based on current town state
+    MCP /decide endpoint - called by AgenticTown orchestrator each cycle.
+
+    Supports two modes via state:
+    - Default: returns upcoming schedule summary
+    - Prediction mode: if state contains {"predict": {"team": "<key>", "game_index": 0}},
+      returns a Claude-powered match prediction for that game
     """
-    logger.info(f"🏒 HubSports decision cycle {request.state.get('cycle', 0)}")
-    
-    # Fetch upcoming games
+    cycle = request.state.get("cycle", 0)
+    logger.info(f"⚽ Sport Match Agent decision cycle {cycle}")
+
+    # Check if the requesting agent wants a prediction
+    predict_request = request.state.get("predict")
+    if predict_request and isinstance(predict_request, dict):
+        team_key = predict_request.get("team", "").lower()
+        game_index = int(predict_request.get("game_index", 0))
+
+        if team_key in PREDICTOR_TEAMS:
+            logger.info(f"🔮 Prediction requested for {team_key} game #{game_index}")
+            result = await run_prediction(team_key, game_index)
+
+            if "error" not in result:
+                pred = result["prediction"]
+                game = result["game"]
+                message = (
+                    f"🔮 Prediction: {game['away']} @ {game['home']} ({game['date']})\n"
+                    f"Winner: {pred['predicted_winner']} "
+                    f"({pred['home_win_probability']}% home / {pred['away_win_probability']}% away)\n"
+                    f"Confidence: {pred['confidence']} | {pred['analysis']}"
+                )
+                return {
+                    "agent_id": request.agent_id,
+                    "actions": [],
+                    "message": message,
+                    "metadata": {
+                        "type": "prediction",
+                        "prediction": result,
+                        "last_updated": datetime.now().isoformat(),
+                    },
+                }
+
+    # Default: return schedule summary
     games = await get_all_upcoming_games(days_ahead=7)
-    
-    # Build summary message
+
     if not games:
         message = "📅 No upcoming Boston sports games in the next 7 days"
     else:
         lines = [f"📅 Upcoming Boston Sports ({len(games)} games):"]
-        for game in games[:5]:  # Show next 5 games
+        for game in games[:5]:
             lines.append(
                 f"{game['emoji']} {game['sport']}: "
                 f"{game['away']} @ {game['home']} - {game['date_str']}"
             )
         message = "\n".join(lines)
-    
-    # For now, this agent just reports data - doesn't take town actions
-    # But we return the data in action metadata
+
     return {
         "agent_id": request.agent_id,
-        "actions": [],  # Not contributing/voting, just providing info
+        "actions": [],
         "message": message,
         "metadata": {
+            "type": "schedule",
             "games_count": len(games),
-            "games": games[:10],  # Include top 10 in metadata
-            "last_updated": datetime.now().isoformat()
-        }
+            "games": games[:10],
+            "last_updated": datetime.now().isoformat(),
+            "hint": "To request a prediction, include {\"predict\": {\"team\": \"celtics\", \"game_index\": 0}} in state",
+        },
     }
 
 
@@ -208,14 +242,16 @@ async def mcp_decide(request: MCPDecideRequest) -> Dict[str, Any]:
 async def root():
     """Root endpoint"""
     return {
-        "app": "HubSports",
-        "version": "1.0.0",
-        "description": "Boston sports schedule aggregator (Patriots, Celtics, Bruins, Red Sox)",
+        "app": "Sport Match Agent",
+        "version": "2.0.0",
+        "description": "Boston sports schedule + AI match prediction (Patriots, Celtics, Bruins, Red Sox)",
         "teams": list(TEAMS.keys()),
         "endpoints": {
             "/schedule": "Get all upcoming games",
             "/schedule/{team}": "Get games for specific team",
-            "/decide": "MCP protocol endpoint for AgenticTown"
+            "/predict/{team}": "Predict next game outcome for a team (AI-powered)",
+            "/predict/{team}/{game_index}": "Predict a specific upcoming game by index",
+            "/decide": "MCP protocol endpoint for AgenticTown (supports prediction requests via state)",
         }
     }
 
@@ -258,7 +294,49 @@ async def get_team_schedule(team: str, days: int = 14):
 @app.get("/health")
 async def health():
     """Health check"""
-    return {"status": "healthy", "app": "HubSports"}
+    return {"status": "healthy", "app": "Sport Match Agent", "version": "2.0.0"}
+
+
+# ============================================================================
+# PREDICTION ENDPOINTS
+# ============================================================================
+
+@app.get("/predict/{team}")
+async def predict_next_game(team: str):
+    """Predict the outcome of the next upcoming game for a team."""
+    team = team.lower()
+    if team not in PREDICTOR_TEAMS:
+        return {
+            "success": False,
+            "error": f"Unknown team: {team}",
+            "available": list(PREDICTOR_TEAMS.keys())
+        }
+
+    result = await run_prediction(team, game_index=0)
+
+    if "error" in result:
+        return {"success": False, "error": result["error"]}
+
+    return {"success": True, **result}
+
+
+@app.get("/predict/{team}/{game_index}")
+async def predict_game_by_index(team: str, game_index: int):
+    """Predict the outcome of a specific upcoming game (by index) for a team."""
+    team = team.lower()
+    if team not in PREDICTOR_TEAMS:
+        return {
+            "success": False,
+            "error": f"Unknown team: {team}",
+            "available": list(PREDICTOR_TEAMS.keys())
+        }
+
+    result = await run_prediction(team, game_index=game_index)
+
+    if "error" in result:
+        return {"success": False, "error": result["error"]}
+
+    return {"success": True, **result}
 
 
 if __name__ == "__main__":

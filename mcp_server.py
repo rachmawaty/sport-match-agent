@@ -154,6 +154,58 @@ async def list_supported_teams() -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+async def predict_match(team: str, game_index: int = 0) -> str:
+    """
+    Predict the outcome of an upcoming game for a Boston sports team using AI analysis.
+
+    Analyzes team records, recent form (last 5 games), and head-to-head history,
+    then uses Claude to produce a win probability estimate with reasoning.
+
+    Args:
+        team: Team key — "patriots", "celtics", "bruins", or "redsox"
+        game_index: Which upcoming game to predict (0 = next game, 1 = game after that, etc.)
+    """
+    from predictor import predict_match as _predict
+
+    result = await _predict(team, game_index)
+
+    if "error" in result:
+        return f"❌ Prediction failed: {result['error']}"
+
+    game = result["game"]
+    pred = result["prediction"]
+    data = result["data_used"]
+
+    lines = [
+        f"{game['emoji']} **Match Prediction — {game['sport']}**",
+        f"📅 {game['away']} @ {game['home']}",
+        f"🗓️  {game['date']}  |  📍 {game['venue']}",
+        "",
+        f"🏆 **Predicted Winner: {pred['predicted_winner']}**",
+        f"📊 Win Probability: {game['home']} {pred['home_win_probability']}%  |  {game['away']} {pred['away_win_probability']}%",
+        f"🎯 Confidence: {pred['confidence'].capitalize()}",
+        "",
+        "🔍 Key Factors:",
+    ]
+    for factor in pred.get("key_factors", []):
+        lines.append(f"  • {factor}")
+
+    lines += [
+        "",
+        f"📝 Analysis: {pred['analysis']}",
+        "",
+        "📈 Data Used:",
+        f"  Home record: {data['home_record']}",
+        f"  Away record: {data['away_record']}",
+    ]
+
+    if data["head_to_head"]:
+        lines.append(f"  H2H (last {len(data['head_to_head'])}): {', '.join(data['head_to_head'])}")
+
+    return "\n".join(lines)
+
+
 # ============================================================================
 # ENTRYPOINT — expose ASGI app for uvicorn (Streamable HTTP at /mcp)
 # ============================================================================
