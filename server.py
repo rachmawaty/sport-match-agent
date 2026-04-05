@@ -3,20 +3,34 @@ Sport Match Agent - Boston Sports Schedule + Match Prediction
 Fetches upcoming games and predicts outcomes using Claude AI.
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
-import httpx
-from datetime import datetime, timedelta
-from dateutil import parser
+from datetime import datetime, timezone
 import logging
+
+import cache
+import scheduler
 from predictor import predict_match as run_prediction, fetch_upcoming_games, TEAMS as PREDICTOR_TEAMS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Sport Match Agent", version="2.0.0")
+
+# ============================================================================
+# LIFESPAN — start/stop heartbeat scheduler
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler.start(run_immediately=True)
+    yield
+    scheduler.stop()
+
+
+app = FastAPI(title="Sport Match Agent", version="2.0.0", lifespan=lifespan)
 
 # CORS
 app.add_middleware(
@@ -27,33 +41,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Team configurations - ESPN API endpoints
-TEAMS = {
-    "patriots": {
-        "name": "New England Patriots",
-        "sport": "NFL",
-        "emoji": "🏈",
-        "api": "http://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/ne/schedule"
-    },
-    "celtics": {
-        "name": "Boston Celtics",
-        "sport": "NBA",
-        "emoji": "🏀",
-        "api": "http://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/bos/schedule"
-    },
-    "bruins": {
-        "name": "Boston Bruins",
-        "sport": "NHL",
-        "emoji": "🏒",
-        "api": "http://site.api.espn.com/apis/site/v2/sports/hockey/nhl/teams/bos/schedule"
-    },
-    "redsox": {
-        "name": "Boston Red Sox",
-        "sport": "MLB",
-        "emoji": "⚾",
-        "api": "http://site.api.espn.com/apis/site/v2/sports/baseball/mlb/teams/bos/schedule"
-    }
-}
+TEAMS = PREDICTOR_TEAMS
 
 
 class MCPDecideRequest(BaseModel):
@@ -70,92 +58,36 @@ class MCPAction(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
-async def fetch_team_schedule(team_key: str, days_ahead: int = 14) -> List[Dict[str, Any]]:
-    """Fetch upcoming games for a team from ESPN API"""
-    team = TEAMS[team_key]
-    
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(team["api"])
-            response.raise_for_status()
-            data = response.json()
-        
-        games = []
-        from datetime import timezone
-        now = datetime.now(timezone.utc)
-        cutoff = now + timedelta(days=days_ahead)
-        
-        # Parse ESPN response
-        events = data.get("events", [])
-        
-        for event in events:
-            try:
-                game_date_str = event.get("date")
-                if not game_date_str:
-                    continue
-                
-                game_date = parser.parse(game_date_str)
-                
-                # Only include upcoming games within the window
-                if game_date < now or game_date > cutoff:
-                    continue
-                
-                competitions = event.get("competitions", [])
-                if not competitions:
-                    continue
-                
-                comp = competitions[0]
-                competitors = comp.get("competitors", [])
-                
-                home_team = None
-                away_team = None
-                
-                for competitor in competitors:
-                    team_info = competitor.get("team", {})
-                    if competitor.get("homeAway") == "home":
-                        home_team = team_info.get("displayName", "Unknown")
-                    else:
-                        away_team = team_info.get("displayName", "Unknown")
-                
-                venue = comp.get("venue", {}).get("fullName", "TBD")
-                status = event.get("status", {}).get("type", {}).get("name", "Scheduled")
-                
-                game = {
-                    "team": team["name"],
-                    "sport": team["sport"],
-                    "emoji": team["emoji"],
-                    "date": game_date.isoformat(),
-                    "date_str": game_date.strftime("%a, %b %d at %I:%M %p"),
-                    "home": home_team,
-                    "away": away_team,
-                    "venue": venue,
-                    "status": status
-                }
-                
-                games.append(game)
-                
-            except Exception as e:
-                logger.warning(f"Error parsing game for {team_key}: {e}")
-                continue
-        
-        return games
-        
-    except Exception as e:
-        logger.error(f"Failed to fetch schedule for {team_key}: {e}")
-        return []
+# ============================================================================
+# INTERNAL HELPERS — cache-first schedule fetching
+# ============================================================================
+
+async def get_team_games(team_key: str, days: int = 14) -> List[Dict[str, Any]]:
+    """Return schedule for a team — from cache if fresh, else live from ESPN."""
+    cached = cache.get(team_key)
+    if cached is not None:
+        logger.info(f"📦 Serving '{team_key}' from cache")
+        return cached
+
+    logger.info(f"🌐 Cache miss for '{team_key}' — fetching live")
+    games = await fetch_upcoming_games(team_key, days_ahead=days)
+    cache.set(team_key, games)
+    return games
 
 
-async def get_all_upcoming_games(days_ahead: int = 14) -> List[Dict[str, Any]]:
-    """Get all upcoming games for all Boston teams"""
+async def get_all_games(days: int = 14) -> List[Dict[str, Any]]:
+    """Return all upcoming games — from cache if fresh, else live."""
+    cached = cache.get("all")
+    if cached is not None:
+        logger.info("📦 Serving 'all' from cache")
+        return cached
+
     all_games = []
-    
-    for team_key in TEAMS.keys():
-        games = await fetch_team_schedule(team_key, days_ahead)
+    for team_key in TEAMS:
+        games = await get_team_games(team_key, days)
         all_games.extend(games)
-    
-    # Sort by date
     all_games.sort(key=lambda g: g["date"])
-    
+    cache.set("all", all_games)
     return all_games
 
 
@@ -169,7 +101,7 @@ async def mcp_decide(request: MCPDecideRequest) -> Dict[str, Any]:
     MCP /decide endpoint - called by AgenticTown orchestrator each cycle.
 
     Supports two modes via state:
-    - Default: returns upcoming schedule summary
+    - Default: returns upcoming schedule summary (served from cache)
     - Prediction mode: if state contains {"predict": {"team": "<key>", "game_index": 0}},
       returns a Claude-powered match prediction for that game
     """
@@ -182,7 +114,7 @@ async def mcp_decide(request: MCPDecideRequest) -> Dict[str, Any]:
         team_key = predict_request.get("team", "").lower()
         game_index = int(predict_request.get("game_index", 0))
 
-        if team_key in PREDICTOR_TEAMS:
+        if team_key in TEAMS:
             logger.info(f"🔮 Prediction requested for {team_key} game #{game_index}")
             result = await run_prediction(team_key, game_index)
 
@@ -202,12 +134,13 @@ async def mcp_decide(request: MCPDecideRequest) -> Dict[str, Any]:
                     "metadata": {
                         "type": "prediction",
                         "prediction": result,
-                        "last_updated": datetime.now().isoformat(),
+                        "last_updated": datetime.now(timezone.utc).isoformat(),
                     },
                 }
 
-    # Default: return schedule summary
-    games = await get_all_upcoming_games(days_ahead=7)
+    # Default: return schedule summary from cache
+    games = await get_all_games(days=7)
+    cache_meta = cache.get_meta("all")
 
     if not games:
         message = "📅 No upcoming Boston sports games in the next 7 days"
@@ -228,14 +161,15 @@ async def mcp_decide(request: MCPDecideRequest) -> Dict[str, Any]:
             "type": "schedule",
             "games_count": len(games),
             "games": games[:10],
-            "last_updated": datetime.now().isoformat(),
+            "cache": cache_meta,
+            "last_updated": datetime.now(timezone.utc).isoformat(),
             "hint": "To request a prediction, include {\"predict\": {\"team\": \"celtics\", \"game_index\": 0}} in state",
         },
     }
 
 
 # ============================================================================
-# STANDALONE ENDPOINTS (for direct querying)
+# STANDALONE ENDPOINTS
 # ============================================================================
 
 @app.get("/")
@@ -247,54 +181,85 @@ async def root():
         "description": "Boston sports schedule + AI match prediction (Patriots, Celtics, Bruins, Red Sox)",
         "teams": list(TEAMS.keys()),
         "endpoints": {
-            "/schedule": "Get all upcoming games",
-            "/schedule/{team}": "Get games for specific team",
-            "/predict/{team}": "Predict next game outcome for a team (AI-powered)",
+            "/schedule": "Get all upcoming games (cache-first)",
+            "/schedule/{team}": "Get games for specific team (cache-first)",
+            "/predict/{team}": "Predict next game outcome for a team (AI-powered, on-demand)",
             "/predict/{team}/{game_index}": "Predict a specific upcoming game by index",
-            "/decide": "MCP protocol endpoint for AgenticTown (supports prediction requests via state)",
-        }
+            "/heartbeat/status": "View heartbeat scheduler status and cache info",
+            "/decide": "MCP protocol endpoint for AgenticTown",
+        },
     }
 
 
 @app.get("/schedule")
 async def get_schedule(days: int = 14):
-    """Get all upcoming Boston sports games"""
-    games = await get_all_upcoming_games(days_ahead=days)
-    
+    """Get all upcoming Boston sports games (served from cache when fresh)."""
+    games = await get_all_games(days=days)
+    meta = cache.get_meta("all")
     return {
         "success": True,
         "count": len(games),
-        "games": games
+        "cache": meta,
+        "games": games,
     }
 
 
 @app.get("/schedule/{team}")
 async def get_team_schedule(team: str, days: int = 14):
-    """Get upcoming games for specific team"""
+    """Get upcoming games for a specific team (served from cache when fresh)."""
     team = team.lower()
-    
     if team not in TEAMS:
         return {
             "success": False,
             "error": f"Unknown team: {team}",
-            "available": list(TEAMS.keys())
+            "available": list(TEAMS.keys()),
         }
-    
-    games = await fetch_team_schedule(team, days_ahead=days)
-    
+
+    games = await get_team_games(team, days=days)
+    meta = cache.get_meta(team)
     return {
         "success": True,
         "team": TEAMS[team]["name"],
         "sport": TEAMS[team]["sport"],
         "count": len(games),
-        "games": games
+        "cache": meta,
+        "games": games,
+    }
+
+
+@app.get("/heartbeat/status")
+async def heartbeat_status():
+    """Show heartbeat scheduler status and current cache state."""
+    jobs = scheduler.scheduler.get_jobs()
+    job_info = []
+    for job in jobs:
+        job_info.append({
+            "id": job.id,
+            "name": job.name,
+            "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+        })
+
+    cache_state = {}
+    for key in list(TEAMS.keys()) + ["all"]:
+        meta = cache.get_meta(key)
+        cache_state[key] = meta if meta else "empty"
+
+    return {
+        "scheduler_running": scheduler.scheduler.running,
+        "jobs": job_info,
+        "cache": cache_state,
     }
 
 
 @app.get("/health")
 async def health():
     """Health check"""
-    return {"status": "healthy", "app": "Sport Match Agent", "version": "2.0.0"}
+    return {
+        "status": "healthy",
+        "app": "Sport Match Agent",
+        "version": "2.0.0",
+        "scheduler_running": scheduler.scheduler.running,
+    }
 
 
 # ============================================================================
@@ -303,39 +268,35 @@ async def health():
 
 @app.get("/predict/{team}")
 async def predict_next_game(team: str):
-    """Predict the outcome of the next upcoming game for a team."""
+    """Predict the outcome of the next upcoming game for a team (on-demand)."""
     team = team.lower()
-    if team not in PREDICTOR_TEAMS:
+    if team not in TEAMS:
         return {
             "success": False,
             "error": f"Unknown team: {team}",
-            "available": list(PREDICTOR_TEAMS.keys())
+            "available": list(TEAMS.keys()),
         }
 
     result = await run_prediction(team, game_index=0)
-
     if "error" in result:
         return {"success": False, "error": result["error"]}
-
     return {"success": True, **result}
 
 
 @app.get("/predict/{team}/{game_index}")
 async def predict_game_by_index(team: str, game_index: int):
-    """Predict the outcome of a specific upcoming game (by index) for a team."""
+    """Predict a specific upcoming game by index for a team (on-demand)."""
     team = team.lower()
-    if team not in PREDICTOR_TEAMS:
+    if team not in TEAMS:
         return {
             "success": False,
             "error": f"Unknown team: {team}",
-            "available": list(PREDICTOR_TEAMS.keys())
+            "available": list(TEAMS.keys()),
         }
 
     result = await run_prediction(team, game_index=game_index)
-
     if "error" in result:
         return {"success": False, "error": result["error"]}
-
     return {"success": True, **result}
 
 
